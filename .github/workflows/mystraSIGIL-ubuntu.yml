@@ -1,0 +1,305 @@
+name: "⚡🔐✋ mystraSIGIL - Ubuntu Fortress"
+
+on:
+  workflow_dispatch:
+    inputs:
+      RUNNER_PROFILE:
+        description: "Select Profile"
+        required: true
+        type: choice
+        default: "Ubuntu Latest"
+        options:
+          - "Ubuntu Latest"
+          - "Ubuntu 24.04"
+          - "Ubuntu 22.04"
+          - "Ubuntu 24.04 ARM"
+          - "Ubuntu 22.04 ARM"
+      CODE:
+        description: "Full headless command (Linux)."
+        required: true
+      RETRIES:
+        description: "CRD Retries"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+env:
+  MYSTRASIGIL_GITLAB_PROJECT: "EsBee-SB/mystrasigil"
+  MYSTRASIGIL_GITLAB_BRANCH:  "main"
+  MYSTRASIGIL_GITLAB_FOLDER:  "Ubuntu"
+
+jobs:
+  initializing-automation:
+    name: "Initializing Automation"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    outputs:
+      runner_label: ${{ steps.resolve.outputs.runner_label }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - id: resolve
+        env:
+          PROFILE: ${{ github.event.inputs.RUNNER_PROFILE }}
+          GITLAB_PROJECT: ${{ env.MYSTRASIGIL_GITLAB_PROJECT }}
+          GITLAB_BRANCH:  ${{ env.MYSTRASIGIL_GITLAB_BRANCH }}
+          GITLAB_FOLDER:  ${{ env.MYSTRASIGIL_GITLAB_FOLDER }}
+        run: |
+          set -uo pipefail
+          GITLAB_PROJECT_ID="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_PROJECT}")"
+
+          get_remote_file_url() {
+            local file_name="$1"
+            local encoded
+            encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_FOLDER}/${file_name}")"
+            echo "https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encoded}/raw?ref=${GITLAB_BRANCH}"
+          }
+
+          write_fallback_map() {
+            cat > /tmp/fallback_map.json <<'EOF'
+          {
+            "version": 1,
+            "default_profile": "Ubuntu Latest",
+            "profiles": {
+              "Ubuntu Latest":    { "id": "ubuntu-latest",    "runner": "ubuntu-latest",    "display_name": "Ubuntu Latest",    "tier": "stable" },
+              "Ubuntu 24.04":     { "id": "ubuntu-24-04",     "runner": "ubuntu-24.04",     "display_name": "Ubuntu 24.04",     "tier": "stable" },
+              "Ubuntu 22.04":     { "id": "ubuntu-22-04",     "runner": "ubuntu-22.04",     "display_name": "Ubuntu 22.04",     "tier": "stable" },
+              "Ubuntu 24.04 ARM": { "id": "ubuntu-24-04-arm", "runner": "ubuntu-24.04-arm", "display_name": "Ubuntu 24.04 ARM", "tier": "preview" },
+              "Ubuntu 22.04 ARM": { "id": "ubuntu-22-04-arm", "runner": "ubuntu-22.04-arm", "display_name": "Ubuntu 22.04 ARM", "tier": "preview" }
+            },
+            "allowed_runners": ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "ubuntu-24.04-arm", "ubuntu-22.04-arm"]
+          }
+          EOF
+          }
+
+          SELECTED_PROFILE="${PROFILE}"
+          MAP_URL="$(get_remote_file_url "mystraSIGIL-runner-map.json")"
+          if [ -z "$MAP_URL" ]; then
+            echo "Resolved runner-map URL is empty - check MYSTRASIGIL_GITLAB_PROJECT/BRANCH/FOLDER in the workflow env." >&2
+            exit 1
+          fi
+
+          MAP_FILE="/tmp/runner_map.json"
+          FETCHED=0
+          for i in 1 2 3; do
+            if curl -fsSL --max-time 45 -o "$MAP_FILE" "$MAP_URL"; then
+              FETCHED=1
+              break
+            fi
+            sleep $((2 * i))
+          done
+
+          if [ "$FETCHED" -eq 1 ] && [ -s "$MAP_FILE" ] && jq -e . "$MAP_FILE" >/dev/null 2>&1; then
+            USED_MAP="$MAP_FILE"
+          else
+            echo "::warning::Hosted map is invalid or unreachable. Using embedded fallback runner map so automation can continue."
+            write_fallback_map
+            USED_MAP="/tmp/fallback_map.json"
+          fi
+
+          PROFILE_OBJ="$(jq -c --arg p "$SELECTED_PROFILE" '.profiles[$p] // empty' "$USED_MAP")"
+          MATCH_TYPE="display_name"
+          if [ -z "$PROFILE_OBJ" ]; then
+            PROFILE_OBJ="$(jq -c --arg p "$SELECTED_PROFILE" '[.profiles[] | select(.id == $p or .runner == $p)][0] // empty' "$USED_MAP")"
+            MATCH_TYPE="id_or_runner"
+          fi
+
+          if [ -z "$PROFILE_OBJ" ]; then
+            AVAILABLE="$(jq -r '.profiles | keys | join(", ")' "$USED_MAP")"
+            echo "Profile '${SELECTED_PROFILE}' not found in hosted map. Available: ${AVAILABLE}" >&2
+            exit 1
+          fi
+
+          RUNNER_LABEL="$(echo "$PROFILE_OBJ" | jq -r '.runner // empty')"
+          if [ -z "$RUNNER_LABEL" ]; then
+            echo "Profile '${SELECTED_PROFILE}' has no 'runner' field." >&2
+            exit 1
+          fi
+
+          ALLOWED_COUNT="$(jq '.allowed_runners | length' "$USED_MAP" 2>/dev/null || echo 0)"
+          if [ "$ALLOWED_COUNT" -eq 0 ]; then
+            echo "Invalid map: missing or empty 'allowed_runners' array." >&2
+            exit 1
+          fi
+          if ! jq -e --arg r "$RUNNER_LABEL" '.allowed_runners | index($r) != null' "$USED_MAP" >/dev/null 2>&1; then
+            ALLOWED_LIST="$(jq -r '.allowed_runners | join(", ")' "$USED_MAP")"
+            echo "Resolved runner '${RUNNER_LABEL}' is not in allowlist: ${ALLOWED_LIST}" >&2
+            exit 1
+          fi
+
+          echo "Profile resolved: input='${SELECTED_PROFILE}' match=${MATCH_TYPE} -> runner=${RUNNER_LABEL}"
+          echo "runner_label=${RUNNER_LABEL}" >> "$GITHUB_OUTPUT"
+
+  crd-register:
+    name: "mystraSIGIL"
+
+    needs: initializing-automation
+
+    runs-on: ${{ needs.initializing-automation.outputs.runner_label }}
+    timeout-minutes: 360
+
+    env:
+      RAW_CODE:      ${{ github.event.inputs.CODE }}
+      RETRIES_INPUT: ${{ github.event.inputs.RETRIES }}
+      BRANCH:        ${{ github.ref_name }}
+      RUNNER_ENV:    "hosted"
+      RUNNER_TITLE:  ${{ github.event.inputs.RUNNER_PROFILE }}
+      MYSTRASIGIL_RUNNER_LABEL: ${{ needs.initializing-automation.outputs.runner_label }}
+      MystraSiGiL_Access_Token: ${{ secrets.MystraSiGiL_Access_Token }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: "Preload"
+        env:
+          GITLAB_PROJECT: ${{ env.MYSTRASIGIL_GITLAB_PROJECT }}
+          GITLAB_BRANCH:  ${{ env.MYSTRASIGIL_GITLAB_BRANCH }}
+          GITLAB_FOLDER:  ${{ env.MYSTRASIGIL_GITLAB_FOLDER }}
+        run: |
+          set -uo pipefail
+          GITLAB_PROJECT_ID="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_PROJECT}")"
+
+          get_remote_file_url() {
+            local file_name="$1"
+            local encoded
+            encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_FOLDER}/${file_name}")"
+            echo "https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encoded}/raw?ref=${GITLAB_BRANCH}"
+          }
+
+          download_with_retry() {
+            local url="$1" out_file="$2" max_attempts="${3:-3}"
+            local attempt
+            for attempt in $(seq 1 "$max_attempts"); do
+              if curl -fsSL --max-time 120 -o "$out_file" "$url" && [ -s "$out_file" ]; then
+                return 0
+              fi
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                sleep $((2 * attempt))
+              fi
+            done
+            return 1
+          }
+
+          if [ -z "${MystraSiGiL_Access_Token:-}" ]; then
+            echo "::error::Missing required repository secret: MystraSiGiL_Access_Token"
+            exit 1
+          fi
+          echo "::add-mask::${MystraSiGiL_Access_Token}"
+          if [ -n "${RAW_CODE:-}" ]; then echo "::add-mask::${RAW_CODE}"; fi
+          echo "Access token present: yes"
+
+          PRELOAD_URL="$(get_remote_file_url "Preload-Assets.sh")"
+          PRELOAD_TMP="/tmp/Preload-Assets_${GITHUB_RUN_ID}.sh"
+
+          if download_with_retry "$PRELOAD_URL" "$PRELOAD_TMP" 3; then
+            chmod +x "$PRELOAD_TMP"
+            if ! bash "$PRELOAD_TMP"; then
+              echo "::warning::Preload script reported a non-zero exit code. Continuing so main automation can still attempt every phase."
+            fi
+          else
+            echo "::warning::Preload step failed non-fatally (download error). Continuing to Execute phase."
+          fi
+          rm -f "$PRELOAD_TMP"
+
+      - name: "Preflight"
+        env:
+          GITLAB_PROJECT: ${{ env.MYSTRASIGIL_GITLAB_PROJECT }}
+          GITLAB_BRANCH:  ${{ env.MYSTRASIGIL_GITLAB_BRANCH }}
+          GITLAB_FOLDER:  ${{ env.MYSTRASIGIL_GITLAB_FOLDER }}
+        run: |
+          set -uo pipefail
+          GITLAB_PROJECT_ID="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_PROJECT}")"
+
+          get_remote_file_url() {
+            local file_name="$1"
+            local encoded
+            encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_FOLDER}/${file_name}")"
+            echo "https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encoded}/raw?ref=${GITLAB_BRANCH}"
+          }
+
+          test_remote_text() {
+            local name="$1" url="$2"
+            local body
+            body="$(curl -fsSL --max-time 45 -L "$url")" || { echo "::error::Preflight failed for ${name}: request error"; exit 1; }
+            if [ -z "$body" ]; then
+              echo "::error::Preflight failed for ${name}: empty response"
+              exit 1
+            fi
+            echo "Preflight OK: ${name}"
+          }
+
+          if [ -z "${MystraSiGiL_Access_Token:-}" ]; then
+            echo "::error::Missing required repository secret: MystraSiGiL_Access_Token"
+            exit 1
+          fi
+          echo "::add-mask::${MystraSiGiL_Access_Token}"
+          if [ -n "${RAW_CODE:-}" ]; then echo "::add-mask::${RAW_CODE}"; fi
+
+          test_remote_text 'runner map' "$(get_remote_file_url "mystraSIGIL-runner-map.json")"
+          test_remote_text 'preload script' "$(get_remote_file_url "Preload-Assets.sh")"
+          test_remote_text 'core engine (Initialize-automation.sh)' "$(get_remote_file_url "Initialize-automation.sh")"
+
+      - name: "Execute"
+        env:
+          GITLAB_PROJECT: ${{ env.MYSTRASIGIL_GITLAB_PROJECT }}
+          GITLAB_BRANCH:  ${{ env.MYSTRASIGIL_GITLAB_BRANCH }}
+          GITLAB_FOLDER:  ${{ env.MYSTRASIGIL_GITLAB_FOLDER }}
+        run: |
+          set -uo pipefail
+          GITLAB_PROJECT_ID="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_PROJECT}")"
+
+          get_remote_file_url() {
+            local file_name="$1"
+            local encoded
+            encoded="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${GITLAB_FOLDER}/${file_name}")"
+            echo "https://gitlab.com/api/v4/projects/${GITLAB_PROJECT_ID}/repository/files/${encoded}/raw?ref=${GITLAB_BRANCH}"
+          }
+
+          download_with_retry() {
+            local url="$1" out_file="$2" max_attempts="${3:-3}"
+            local attempt
+            for attempt in $(seq 1 "$max_attempts"); do
+              if curl -fsSL --max-time 120 -o "$out_file" "$url" && [ -s "$out_file" ]; then
+                return 0
+              fi
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                sleep $((2 * attempt))
+              fi
+            done
+            return 1
+          }
+
+          if [ -z "${MystraSiGiL_Access_Token:-}" ]; then
+            echo "::error::Missing required repository secret: MystraSiGiL_Access_Token"
+            exit 1
+          fi
+          echo "::add-mask::${MystraSiGiL_Access_Token}"
+          if [ -n "${RAW_CODE:-}" ]; then echo "::add-mask::${RAW_CODE}"; fi
+
+          URL="$(get_remote_file_url "Initialize-automation.sh")"
+          SCRIPT_TMP="/tmp/Initialize-automation_${GITHUB_RUN_ID}.sh"
+
+          if ! download_with_retry "$URL" "$SCRIPT_TMP" 3; then
+            echo "::error::Failed to download Initialize-automation.sh after 3 attempts."
+            exit 1
+          fi
+          chmod +x "$SCRIPT_TMP"
+
+          set +e
+          bash "$SCRIPT_TMP"
+          EXIT_CODE=$?
+          set -e
+          rm -f "$SCRIPT_TMP"
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "::error::Execution script failed with exit code ${EXIT_CODE}"
+            exit 1
+          fi
